@@ -2,7 +2,7 @@
 
 import os
 os.environ["GROQ_API_KEY"] = " "
-os.environ["OPENWEATHER_API_KEY"] = "222e0bc513d4300c405c738bf076af8e"  # openweathermap.org
+os.environ["OPENWEATHER_API_KEY"] = " "  # openweathermap.org
 
 !pip install -q deep-translator langgraph langchain-groq groq requests twilio python-dotenv
 """
