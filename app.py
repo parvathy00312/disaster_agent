@@ -1,4 +1,3 @@
-!pip install langgraph langchain-groq requests
 
 import os
 os.environ["GROQ_API_KEY"] = " "
