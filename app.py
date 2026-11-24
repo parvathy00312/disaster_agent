@@ -1,18 +1,54 @@
-import streamlit as st
+!pip install langgraph langchain-groq requests
+
 import os
-import requests
-from langgraph.graph import StateGraph, END
-from langchain_groq import ChatGroq
+os.environ["GROQ_API_KEY"] = " "
+os.environ["OPENWEATHER_API_KEY"] = "222e0bc513d4300c405c738bf076af8e"  # openweathermap.org
+
+!pip install -q deep-translator langgraph langchain-groq groq requests twilio python-dotenv
+"""
+Disaster alert agent (LangGraph).
+Pipeline: intake (OpenWeather) -> router (rules, LLM for ambiguous cases)
+          -> localize (LLM English + Google Translate) -> escalate (SMS/call or simulated)
+"""
+
+import os
+import time
 from typing import TypedDict
+from xml.sax.saxutils import escape
+
+import requests
 from deep_translator import GoogleTranslator
+from deep_translator.exceptions import TooManyRequests
+from langchain_groq import ChatGroq
+from langgraph.graph import StateGraph, END
 
-os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
-os.environ["OPENWEATHER_API_KEY"] = st.secrets["OPENWEATHER_API_KEY"]
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
-SIMULATE_TWILIO = True
+# ---------------------------------------------------------------------------
+# Configuration (read from environment; never hardcode secrets)
+# ---------------------------------------------------------------------------
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+SIMULATE_TWILIO = os.environ.get("SIMULATE_TWILIO", "true").lower() == "true"
+VALID_SEVERITIES = {"SAFE", "WATCH", "WARNING", "EMERGENCY"}
 
-class DisasterState(TypedDict):
+LANG_CODES = {
+    "Hindi": "hi",
+    "Malayalam": "ml",
+    "Tamil": "ta",
+    "Telugu": "te",
+    "Bengali": "bn",
+    "Kannada": "kn",
+}
+
+# Emergency numbers are read from the environment so no real phone numbers live in code
+ALERT_RECIPIENT = os.environ.get("ALERT_RECIPIENT", "")
+
+llm = ChatGroq(model=GROQ_MODEL, temperature=0)
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+class DisasterState(TypedDict, total=False):
     location: str
     temperature: float
     rainfall: float
@@ -23,203 +59,251 @@ class DisasterState(TypedDict):
     language: str
     log_entry: str
 
-# ============ PASTE YOUR 4 NODE FUNCTIONS HERE ============
-# data_intake_node
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def parse_severity(text: str) -> str:
+    """Return a valid severity word. Unparseable output escalates to WATCH, never SAFE."""
+    for line in text.splitlines():
+        if line.strip().upper().startswith("SEVERITY:"):
+            word = line.split(":", 1)[1].strip().upper()
+            if word in VALID_SEVERITIES:
+                return word
+    return "WATCH"
 
 
+def parse_reasoning(text: str) -> str:
+    for line in text.splitlines():
+        if line.strip().upper().startswith("REASONING:"):
+            return line.split(":", 1)[1].strip()
+    return "Model reasoning unavailable; classified conservatively."
+
+
+def translate_with_retry(text: str, target: str, source: str = "en", retries: int = 3) -> str:
+    """Translate with exponential backoff on rate limits. Falls back to the original text."""
+    for attempt in range(retries):
+        try:
+            return GoogleTranslator(source=source, target=target).translate(text)
+        except TooManyRequests:
+            wait = 2 ** attempt  # 1s, 2s, 4s
+            print(f"Translation rate limited. Retrying in {wait}s...")
+            time.sleep(wait)
+        except Exception as e:  # network errors, invalid payloads, etc.
+            print(f"Translation error: {e}")
+            break
+    print("Translation unavailable. Falling back to English.")
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Node 1: intake
+# ---------------------------------------------------------------------------
 def data_intake_node(state: DisasterState):
     location = state["location"]
-    api_key = os.environ["OPENWEATHER_API_KEY"]
-    url = f"https://api.openweathermap.org/data/2.5/weather?q={location}&appid={api_key}&units=metric"
+    api_key = os.environ.get("OPENWEATHER_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENWEATHER_API_KEY is not set")
 
-    response = requests.get(url)
+    response = requests.get(
+        "https://api.openweathermap.org/data/2.5/weather",
+        params={"q": location, "appid": api_key, "units": "metric"},
+        timeout=10,
+    )
+    response.raise_for_status()
     data = response.json()
 
-    rainfall = data.get("rain", {}).get("1h", 0)  # rainfall in mm in last 1hr, 0 if none
+    rainfall = data.get("rain", {}).get("1h", 0)           # mm in last hour
     temperature = data["main"]["temp"]
-    wind_speed = data["wind"]["speed"] * 3.6  # convert m/s to km/h
+    wind_speed = data["wind"]["speed"] * 3.6               # m/s -> km/h
 
-    print(f"Fetched: {location} | Temp: {temperature}°C | Rain: {rainfall}mm | Wind: {wind_speed}km/h")
+    print(f"Fetched: {location} | Temp: {temperature}°C | Rain: {rainfall}mm | Wind: {wind_speed:.1f}km/h")
 
     return {
         "location": location,
         "temperature": temperature,
         "rainfall": rainfall,
-        "wind_speed": wind_speed
+        "wind_speed": wind_speed,
     }
 
-# severity_router_node
 
+# ---------------------------------------------------------------------------
+# Node 2: severity router (rules first, LLM only for ambiguous cases)
+# ---------------------------------------------------------------------------
 def severity_router_node(state: DisasterState):
     rainfall = state["rainfall"]
     wind_speed = state["wind_speed"]
 
-    # HARDCODED thresholds first — instant, no LLM cost, no hallucination risk
+    # Hardcoded thresholds: instant, free, no hallucination risk
     if rainfall > 100 or wind_speed > 90:
-        severity = "EMERGENCY"
-        reasoning = f"Hardcoded rule triggered: rainfall={rainfall}mm, wind={wind_speed}km/h exceeds emergency threshold"
-        return {"severity": severity, "reasoning": reasoning}
+        return {
+            "severity": "EMERGENCY",
+            "reasoning": f"Rule triggered: rainfall={rainfall}mm, wind={wind_speed:.1f}km/h exceeds emergency threshold",
+        }
 
     if rainfall < 10 and wind_speed < 30:
-        severity = "SAFE"
-        reasoning = f"Hardcoded rule triggered: rainfall={rainfall}mm, wind={wind_speed}km/h within safe range"
-        return {"severity": severity, "reasoning": reasoning}
+        return {
+            "severity": "SAFE",
+            "reasoning": f"Rule triggered: rainfall={rainfall}mm, wind={wind_speed:.1f}km/h within safe range",
+        }
 
-    # AMBIGUOUS case — only NOW do we call the LLM (saves cost, matches video's chest-pain logic)
+    # Ambiguous: ask the LLM
     prompt = f"""You are a disaster risk classifier. Based on this data:
-    Rainfall: {rainfall}mm/hr
-    Wind Speed: {wind_speed}km/h
+Rainfall: {rainfall}mm/hr
+Wind speed: {wind_speed:.1f}km/h
 
-    Classify the risk as exactly one word: SAFE, WATCH, WARNING, or EMERGENCY.
-    Then on a new line, give a one-sentence reasoning.
+Classify the risk as exactly one word: SAFE, WATCH, WARNING, or EMERGENCY.
+Then on a new line, give a one-sentence reasoning.
 
-    Respond in this exact format:
-    SEVERITY: <word>
-    REASONING: <one sentence>
-    """
+Respond in this exact format:
+SEVERITY: <word>
+REASONING: <one sentence>
+"""
+    try:
+        text = llm.invoke(prompt).content
+    except Exception as e:
+        print(f"LLM classification failed: {e}")
+        return {
+            "severity": "WATCH",
+            "reasoning": "Classifier unavailable; escalated conservatively for human review.",
+        }
 
-    response = llm.invoke(prompt)
-    text = response.content
-
-    severity = text.split("SEVERITY:")[1].split("\n")[0].strip()
-    reasoning = text.split("REASONING:")[1].strip()
-
-    return {"severity": severity, "reasoning": reasoning}
-
-
-
-# localization_node  (the GoogleTranslator version)
+    return {"severity": parse_severity(text), "reasoning": parse_reasoning(text)}
 
 
-from deep_translator import GoogleTranslator
+def route_after_severity(state: DisasterState):
+    return "skip_to_log" if state["severity"] == "SAFE" else "localize"
 
+
+# ---------------------------------------------------------------------------
+# Node 3: localization (LLM writes English, Google Translate handles the local language)
+# ---------------------------------------------------------------------------
 def localization_node(state: DisasterState):
     severity = state["severity"]
     reasoning = state["reasoning"]
     location = state["location"]
     language = state.get("language", "Hindi")
 
-    # Step 1: LLM writes ONLY in English — this is what it's actually good at
-    prompt = f"""You are writing a disaster alert for a rural/elderly audience.
+    prompt = f"""You are writing a disaster alert for a rural and elderly audience.
 
-    Location: {location}
-    Severity: {severity}
-    Technical reasoning: {reasoning}
+Location: {location}
+Severity: {severity}
+Technical reasoning: {reasoning}
 
-    Write a short alert message (2-3 sentences max) using:
-    - Very simple words (5th-grade reading level)
-    - Clear action instruction (what should the person DO right now)
-    - No technical jargon (no mm, km/h, meteorological terms)
+Write a short alert message (2-3 sentences max) using:
+- Very simple words (5th-grade reading level)
+- A clear action instruction (what the person should do right now)
+- No technical jargon (no mm, km/h, or meteorological terms)
 
-    Respond with ONLY the English alert message, nothing else.
-    """
+Respond with ONLY the English alert message, nothing else.
+"""
+    try:
+        english_msg = llm.invoke(prompt).content.strip()
+    except Exception as e:
+        print(f"LLM alert writing failed: {e}")
+        english_msg = (
+            f"{severity} alert for {location}. Stay indoors, keep your phone charged, "
+            "and follow instructions from local authorities."
+        )
 
-    response = llm.invoke(prompt)
-    english_msg = response.content.strip()
-
-    # Step 2: Translate using Google Translate (much better grammar than LLM translation)
-    lang_codes = {
-        "Hindi": "hi", "Malayalam": "ml", "Tamil": "ta",
-        "Telugu": "te", "Bengali": "bn", "Kannada": "kn"
-    }
-    lang_code = lang_codes.get(language, "hi")
-
-    local_msg = GoogleTranslator(source='en', target=lang_code).translate(english_msg)
+    lang_code = LANG_CODES.get(language, "hi")
+    local_msg = translate_with_retry(english_msg, target=lang_code)
 
     alert_message = {
         "english": english_msg,
         "local": local_msg,
-        "local_language": language
+        "local_language": language,
     }
-
     print(f"English: {english_msg}")
     print(f"{language}: {local_msg}")
-
     return {"alert_message": alert_message}
 
-# escalation_node
+
+# ---------------------------------------------------------------------------
+# Node 4: escalation
+# ---------------------------------------------------------------------------
+def send_live_alerts(severity: str, location: str, alert_message: dict) -> str:
+    """Send real SMS/calls via Twilio. Imported lazily so the demo runs without twilio installed."""
+    from twilio.rest import Client
+
+    sid = os.environ.get("TWILIO_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    from_number = os.environ.get("TWILIO_PHONE")
+    if not all([sid, token, from_number, ALERT_RECIPIENT]):
+        return f"[{severity}] {location}: Live alert skipped, Twilio credentials or ALERT_RECIPIENT missing"
+
+    client = Client(sid, token)
+    sms_body = f"{alert_message['english']}\n\n{alert_message['local']}"
+    twiml = f"<Response><Say>{escape(alert_message['english'])}</Say></Response>"
+
+    try:
+        client.messages.create(body=sms_body, from_=from_number, to=ALERT_RECIPIENT)
+        if severity in {"WARNING", "EMERGENCY"}:
+            client.calls.create(twiml=twiml, from_=from_number, to=ALERT_RECIPIENT)
+    except Exception as e:
+        return f"[{severity}] {location}: Escalation attempted but failed: {e}"
+
+    if severity == "EMERGENCY":
+        return f"[EMERGENCY] {location}: SMS + Call sent, authority alert logged"
+    if severity == "WARNING":
+        return f"[WARNING] {location}: SMS + Call sent"
+    return f"[WATCH] {location}: SMS sent"
+
 
 def escalation_node(state: DisasterState):
     severity = state["severity"]
     location = state["location"]
 
-    # Handle SAFE case FIRST — no alert_message exists since localize was skipped
     if severity == "SAFE":
         log_entry = f"[SAFE] {location}: No action needed"
-        print(log_entry)
-        return {"log_entry": log_entry}
-
-    # For all other severities, alert_message will exist
-    alert_message = state["alert_message"]
-
-    if SIMULATE_TWILIO:
-        if severity == "WATCH":
-            log_entry = f"[WATCH] {location}: SIMULATED SMS sent -> {alert_message['english']}"
-        elif severity == "WARNING":
-            log_entry = f"[WARNING] {location}: SIMULATED SMS + Call sent -> {alert_message['english']}"
-        else:  # EMERGENCY
-            log_entry = f"[EMERGENCY] {location}: SIMULATED SMS + Call + Authority Alert Logged -> {alert_message['english']}"
-        print(log_entry)
-        return {"log_entry": log_entry}
-
-
-def route_after_severity(state: DisasterState):
-    if state["severity"] == "SAFE":
-        return "skip_to_log"
+    elif SIMULATE_TWILIO:
+        english = state["alert_message"]["english"]
+        log_entry = f"[{severity}] {location}: SIMULATED alert -> {english}"
     else:
-        return "localize"
+        log_entry = send_live_alerts(severity, location, state["alert_message"])
 
-graph = StateGraph(DisasterState)
-graph.add_node("intake", data_intake_node)
-graph.add_node("router", severity_router_node)
-graph.add_node("localize", localization_node)
-graph.add_node("escalate", escalation_node)
-graph.set_entry_point("intake")
-graph.add_edge("intake", "router")
-graph.add_conditional_edges("router", route_after_severity, {"localize": "localize", "skip_to_log": "escalate"})
-graph.add_edge("localize", "escalate")
-graph.add_edge("escalate", END)
-app_graph = graph.compile()
+    print(log_entry)
+    return {"log_entry": log_entry}
 
-st.set_page_config(page_title="Disaster Alert AI Agent", page_icon="🌪️")
-st.title("🌪️ Disaster Climate Alert AI Agent")
-st.write("Autonomous agent for hyperlocal risk detection, multi-language alerts, and automated escalation.")
 
-location = st.text_input("Enter Location (city name)", "Kochi")
-language = st.selectbox("Local Language", ["Hindi", "Malayalam", "Tamil", "Telugu", "Bengali", "Kannada"])
+# ---------------------------------------------------------------------------
+# Graph
+# ---------------------------------------------------------------------------
+def build_graph():
+    graph = StateGraph(DisasterState)
 
-if st.button("Run Disaster Risk Check"):
-    with st.spinner("Agent analyzing risk..."):
-        result = app_graph.invoke({"location": location, "language": language})
+    graph.add_node("intake", data_intake_node)
+    graph.add_node("router", severity_router_node)
+    graph.add_node("localize", localization_node)
+    graph.add_node("escalate", escalation_node)
 
-    st.subheader("Result")
-    st.metric("Severity", result["severity"])
-    st.write(f"**Reasoning:** {result['reasoning']}")
+    graph.set_entry_point("intake")
+    graph.add_edge("intake", "router")
+    graph.add_conditional_edges(
+        "router",
+        route_after_severity,
+        {"localize": "localize", "skip_to_log": "escalate"},
+    )
+    graph.add_edge("localize", "escalate")
+    graph.add_edge("escalate", END)
 
-    if result.get("alert_message"):
-        st.write("**Alert (English):**", result["alert_message"]["english"])
-        st.write(f"**Alert ({language}):**", result["alert_message"]["local"])
+    return graph.compile()
 
-    st.write("**Action Log:**", result["log_entry"])
 
-#demo
+app = build_graph()
 
-    st.divider()
-st.subheader("🧪 Demo: Simulated Emergency Scenario")
-st.caption("Since real-time weather changes unpredictably, use this to demonstrate the full pipeline (including translation + escalation).")
 
-if st.button("Run Simulated Emergency Test"):
-    with st.spinner("Agent analyzing simulated emergency..."):
-        test_state = {"location": location, "language": language, "rainfall": 150, "wind_speed": 40}
-        state_after_router = severity_router_node(test_state)
-        test_state.update(state_after_router)
-        state_after_local = localization_node(test_state)
-        test_state.update(state_after_local)
-        state_after_escalate = escalation_node(test_state)
-        test_state.update(state_after_escalate)
+# ---------------------------------------------------------------------------
+# Entry point: nothing runs on import
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    final = app.invoke({"location": "Kochi", "language": "Malayalam"})
 
-    st.metric("Severity", test_state["severity"])
-    st.write(f"**Reasoning:** {test_state['reasoning']}")
-    st.write("**Alert (English):**", test_state["alert_message"]["english"])
-    st.write(f"**Alert ({language}):**", test_state["alert_message"]["local"])
-    st.write("**Action Log:**", test_state["log_entry"])
+    print("\n--- FINAL RESULT ---")
+    print(f"Location: {final['location']}")
+    print(f"Severity: {final['severity']}")
+    print(f"Reasoning: {final['reasoning']}")
+    if final.get("alert_message"):
+        print(f"Alert (EN): {final['alert_message']['english']}")
+        print(f"Alert (Local): {final['alert_message']['local']}")
+    print(f"Log: {final['log_entry']}")
