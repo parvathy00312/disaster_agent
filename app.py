@@ -3,7 +3,7 @@ import os
 os.environ["GROQ_API_KEY"] = " "
 os.environ["OPENWEATHER_API_KEY"] = " "  # openweathermap.org
 
-!pip install -q deep-translator langgraph langchain-groq groq requests twilio python-dotenv
+
 """
 Disaster alert agent (LangGraph).
 Pipeline: intake (OpenWeather) -> router (rules, LLM for ambiguous cases)
