@@ -1,5 +1,8 @@
 streamlit
 langgraph
 langchain-groq
+groq
 requests
 deep-translator
+twilio
+python-dotenv
